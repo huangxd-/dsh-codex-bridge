@@ -1,0 +1,301 @@
+/** Unit test: mock the codex process through the spawnImpl seam. */
+import assert from "node:assert";
+import { streamCodexExec } from "../src/adapter.js";
+
+const spawnCalls = [];
+const stdinWrites = [];
+
+/** Build a fake codex that emits the given JSONL events and exits. */
+function makeFakeSpawn({ events, exitCode = 0 } = {}) {
+  return function fakeSpawn(bin, args, options) {
+    spawnCalls.push({ bin, args, options });
+    const stdoutL = [];
+    const stderrL = [];
+    const closeL = [];
+    const child = {
+      stdin: {
+        write(data) { stdinWrites.push(String(data)); },
+        end() { setTimeout(finish, 5); },
+        on() {},
+      },
+      stdout: {
+        setEncoding() {},
+        on(e, f) { if (e === "data") stdoutL.push(f); },
+        once() {},
+        off() {},
+      },
+      stderr: {
+        setEncoding() {},
+        on(e, f) { if (e === "data") stderrL.push(f); },
+      },
+      on(e, f) { if (e === "close") closeL.push(f); },
+      kill() {},
+    };
+    function finish() {
+      const stream = events
+        .map((event) => JSON.stringify(event))
+        .join("\n") + "\n";
+      for (const fn of stdoutL) fn(stream);
+      setTimeout(() => {
+        for (const fn of closeL) fn(exitCode);
+      }, 5);
+    }
+    return child;
+  };
+}
+
+async function collect(options, spawnImpl) {
+  const chunks = [];
+  for await (const chunk of streamCodexExec(options, {
+    sandboxMode: "read-only",
+    defaultReasoningEffort: "high",
+    codexBin: "fake-codex",
+    spawnImpl,
+  })) {
+    chunks.push(chunk);
+  }
+  return chunks;
+}
+
+/** Enforce the llm/stream invariant grammar over emitted chunks. */
+function assertInvariant(chunks, label) {
+  const open = new Map();
+  let usageSeen = false;
+  let finished = false;
+  for (const chunk of chunks) {
+    assert.ok(!finished, `${label}: chunk after terminal finish`);
+    switch (chunk.type) {
+      case "block-start":
+        assert.ok(!open.has(chunk.index), `${label}: repeated block-start index ${chunk.index}`);
+        assert.ok(Number.isSafeInteger(chunk.index) && chunk.index >= 0, `${label}: bad index`);
+        open.set(chunk.index, chunk.blockType);
+        break;
+      case "text-delta":
+        assert.equal(open.get(chunk.index), "text", `${label}: text delta needs open text block`);
+        break;
+      case "reasoning-delta":
+        assert.equal(open.get(chunk.index), "reasoning", `${label}: reasoning delta needs open reasoning block`);
+        break;
+      case "block-end": {
+        assert.equal(open.get(chunk.index), chunk.block.type, `${label}: block-end type mismatch`);
+        open.delete(chunk.index);
+        break;
+      }
+      case "usage":
+        assert.ok(!usageSeen, `${label}: usage twice`);
+        usageSeen = true;
+        break;
+      case "finish":
+        assert.ok(open.size === 0 || chunk.reason.kind === "error" || chunk.reason.kind === "aborted",
+          `${label}: finish with ${open.size} open block(s)`);
+        finished = true;
+        break;
+    }
+  }
+  assert.ok(finished, `${label}: stream ended without finish`);
+}
+
+const baseOptions = {
+  provider: "codex",
+  model: "gpt-6-astra",
+  system: "Be helpful.",
+  reasoningEffort: "high",
+  messages: [
+    { role: "user", content: [{ type: "text", text: "6*7?" }] },
+    { role: "assistant", content: [{ type: "text", text: "是 42。" }] },
+    { role: "user", content: [{ type: "text", text: "再问一次" }] },
+  ],
+};
+
+// ---------- 1. happy path ----------
+const chunks = await collect(baseOptions, makeFakeSpawn({
+  events: [
+    { type: "thread.started", thread_id: "th_1" },
+    { type: "turn.started" },
+    { type: "item.started", item: { id: "rs_1", type: "reasoning" } },
+    { type: "item.completed", item: { id: "rs_1", type: "reasoning", text: "Let me compute." } },
+    { type: "item.completed", item: { id: "ag_1", type: "agent_message", text: "答案是 42。" } },
+    {
+      type: "turn.completed",
+      usage: {
+        input_tokens: 100,
+        cached_input_tokens: 20,
+        output_tokens: 30,
+        reasoning_output_tokens: 5,
+      },
+    },
+  ],
+}));
+assertInvariant(chunks, "happy");
+
+const text = chunks
+  .filter((c) => c.type === "text-delta").map((c) => c.text).join("");
+assert.equal(text, "答案是 42。", "text assembled");
+const reasoning = chunks
+  .filter((c) => c.type === "reasoning-delta").map((c) => c.text).join("");
+assert.equal(reasoning, "Let me compute.", "reasoning assembled");
+
+const usage = chunks.find((c) => c.type === "usage")?.usage;
+assert.equal(usage.inputTokens, 80, "usage input excludes cache");
+assert.equal(usage.outputTokens, 30, "usage output");
+assert.equal(usage.totalTokens, 130, "usage total");
+assert.equal(usage.cacheReadTokens, 20, "usage cache read");
+assert.equal(usage.reasoningTokens, 5, "usage reasoning");
+const finish = chunks.find((c) => c.type === "finish");
+assert.equal(finish?.reason?.kind, "stop", "finish stop");
+
+// block indices are distinct
+const starts = chunks.filter((c) => c.type === "block-start").map((c) => c.index);
+assert.equal(new Set(starts).size, starts.length, "distinct block indices");
+
+// spawn args
+const call = spawnCalls[0];
+assert.equal(call.bin, "fake-codex", "uses configured bin");
+assert.ok(call.args.includes("exec"), "exec subcommand");
+assert.ok(call.args.includes("--json"), "json flag");
+assert.ok(call.args.includes("--ephemeral"), "ephemeral flag");
+assert.equal(call.args[call.args.indexOf("-m") + 1], "gpt-6-astra");
+assert.ok(
+  call.args[call.args.indexOf("-c") + 1].includes('model_reasoning_effort="high"'),
+  "effort override",
+);
+
+// prompt rendering
+const stdin = stdinWrites[0];
+assert.ok(stdin.includes("[system instructions]"), "system rendered");
+assert.ok(stdin.includes("[assistant replied]"), "assistant history rendered");
+assert.ok(stdin.includes("[user said]"), "prior user turns rendered");
+assert.ok(stdin.endsWith("再问一次"), "latest user message last");
+
+// ---------- 2. multiple reasoning + message items get fresh indices ----------
+const multiChunks = await collect(
+  { ...baseOptions, messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
+  makeFakeSpawn({
+    events: [
+      { type: "turn.started" },
+      { type: "item.completed", item: { id: "rs_1", type: "reasoning", text: "think A" } },
+      { type: "item.completed", item: { id: "rs_2", type: "reasoning", text: "think B" } },
+      { type: "item.completed", item: { id: "ag_1", type: "agent_message", text: "ans A" } },
+      { type: "item.completed", item: { id: "ag_2", type: "agent_message", text: "ans B" } },
+      { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } },
+    ],
+  }),
+);
+assertInvariant(multiChunks, "multi");
+const mStarts = multiChunks.filter((c) => c.type === "block-start");
+assert.equal(mStarts.length, 4, "four blocks");
+assert.equal(
+  new Set(mStarts.map((c) => c.index)).size, 4, "four distinct indices",
+);
+const mText = multiChunks
+  .filter((c) => c.type === "text-delta").map((c) => c.text).join("");
+assert.equal(mText, "ans Aans B", "multi text assembled");
+const mEnds = multiChunks.filter((c) => c.type === "block-end");
+assert.equal(mEnds.length, 4, "all blocks closed");
+
+// ---------- 3. reconnect errors must not kill the stream ----------
+const reconnectChunks = await collect(
+  baseOptions,
+  makeFakeSpawn({
+    events: [
+      { type: "thread.started", thread_id: "th_2" },
+      { type: "turn.started" },
+      { type: "error", message: "Reconnecting... 1/5 (high demand)" },
+      { type: "error", message: "Reconnecting... 2/5 (high demand)" },
+      { type: "item.completed", item: { id: "ag_1", type: "agent_message", text: "recovered answer" } },
+      { type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } },
+    ],
+  }),
+);
+assertInvariant(reconnectChunks, "reconnect");
+const rText = reconnectChunks
+  .filter((c) => c.type === "text-delta").map((c) => c.text).join("");
+assert.equal(rText, "recovered answer", "stream survives reconnect errors");
+assert.equal(
+  reconnectChunks.find((c) => c.type === "finish")?.reason?.kind, "stop",
+  "reconnect case finishes stop",
+);
+
+// ---------- 4. turn.failed maps to error finish, closes open blocks ----------
+const failedChunks = await collect(
+  baseOptions,
+  makeFakeSpawn({
+    events: [
+      { type: "thread.started", thread_id: "th_3" },
+      { type: "turn.started" },
+      { type: "item.started", item: { id: "rs_1", type: "reasoning" } },
+      { type: "item.updated", item: { id: "rs_1", type: "reasoning", text: "partial thought" } },
+      { type: "turn.failed", error: { message: "We're experiencing high demand." } },
+    ],
+    exitCode: 1,
+  }),
+);
+assertInvariant(failedChunks, "failed");
+const fFinish = failedChunks.find((c) => c.type === "finish");
+assert.equal(fFinish?.reason?.kind, "error", "turn.failed -> error finish");
+assert.match(fFinish?.reason?.failure?.message ?? "", /high demand/, "failure message");
+assert.equal(fFinish?.reason?.failure?.code, "UPSTREAM_ERROR");
+const fReasoning = failedChunks
+  .filter((c) => c.type === "reasoning-delta").map((c) => c.text).join("");
+assert.equal(fReasoning, "partial thought", "partial reasoning kept before failure");
+
+// ---------- 5. empty response maps to EMPTY_RESPONSE ----------
+const emptyChunks = await collect(
+  baseOptions,
+  makeFakeSpawn({
+    events: [
+      { type: "thread.started", thread_id: "th_4" },
+      { type: "turn.started" },
+      { type: "turn.completed", usage: { input_tokens: 3, output_tokens: 0 } },
+    ],
+  }),
+);
+assertInvariant(emptyChunks, "empty");
+const eFinish = emptyChunks.find((c) => c.type === "finish");
+assert.equal(eFinish?.reason?.kind, "error", "empty -> error finish");
+assert.equal(eFinish?.reason?.failure?.code, "EMPTY_RESPONSE");
+
+// ---------- 6. abort mid-stream -> aborted finish ----------
+const abortController = new AbortController();
+const abortingSpawn = makeFakeSpawn({
+  events: [
+    { type: "turn.started" },
+    { type: "item.updated", item: { id: "ag_1", type: "agent_message", text: "partial" } },
+    // no turn.completed / close: hangs like a stuck process
+  ],
+  exitCode: null,
+});
+// custom spawn that never closes, aborted externally
+const hangingSpawn = function (bin, args, options) {
+  spawnCalls.push({ bin, args, options });
+  const stdoutL = [];
+  const child = {
+    stdin: { write(d) { stdinWrites.push(String(d)); }, end() {}, on() {} },
+    stdout: { setEncoding() {}, on(e, f) { if (e === "data") stdoutL.push(f); }, once() {}, off() {} },
+    stderr: { setEncoding() {}, on() {} },
+    on() {},
+    kill() {},
+  };
+  setTimeout(() => {
+    for (const fn of stdoutL) {
+      fn(
+        JSON.stringify({ type: "item.updated", item: { id: "ag_1", type: "agent_message", text: "partial" } }) + "\n",
+      );
+    }
+    setTimeout(() => abortController.abort(), 10);
+  }, 5);
+  return child;
+};
+const abortChunks = [];
+for await (const chunk of streamCodexExec(
+  { ...baseOptions, signal: abortController.signal },
+  { sandboxMode: "read-only", defaultReasoningEffort: "high", codexBin: "fake-codex", spawnImpl: hangingSpawn },
+)) {
+  abortChunks.push(chunk);
+}
+assertInvariant(abortChunks, "abort");
+const aFinish = abortChunks.find((c) => c.type === "finish");
+assert.equal(aFinish?.reason?.kind, "aborted", "abort -> aborted finish");
+
+console.log("ALL 6 SCENARIOS PASSED (incl. llm/stream invariant grammar)");
+console.log("1 happy | 2 multi-block indices | 3 reconnect survives | 4 turn.failed | 5 empty | 6 abort");

@@ -1,0 +1,32 @@
+{
+  "name": "dsh-codex-bridge",
+  "description": "Use the locally logged-in Codex CLI (codex exec) as a DSH model provider: reuse existing auth, models and reasoning from the CLI without re-login",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "src",
+    "test",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "license": "Apache-2.0",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "codex",
+    "llm",
+    "provider"
+  ]
+}

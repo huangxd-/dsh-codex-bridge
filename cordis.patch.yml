@@ -1,0 +1,7 @@
+# Register the codex-bridge LLM adapter entry. The adapter itself is inert
+# until the user selects the `codex` provider in the Models page; this patch
+# only inserts the plugin bundle into the composition.
+
+- insert:
+    - id: llm-codex-bridge
+      name: dsh-codex-bridge
