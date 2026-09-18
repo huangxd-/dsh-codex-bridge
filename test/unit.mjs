@@ -4,6 +4,7 @@ import { streamCodexExec } from "../src/adapter.js";
 
 const spawnCalls = [];
 const stdinWrites = [];
+const killCalls = [];
 
 /** Build a fake codex that emits the given JSONL events and exits. */
 function makeFakeSpawn({ events, exitCode = 0 } = {}) {
@@ -44,17 +45,52 @@ function makeFakeSpawn({ events, exitCode = 0 } = {}) {
   };
 }
 
-async function collect(options, spawnImpl) {
+async function collect(options, spawnImpl, extraConfig = {}) {
   const chunks = [];
   for await (const chunk of streamCodexExec(options, {
     sandboxMode: "read-only",
     defaultReasoningEffort: "high",
     codexBin: "fake-codex",
     spawnImpl,
+    ...extraConfig,
   })) {
     chunks.push(chunk);
   }
   return chunks;
+}
+
+/** Fake codex that streams events but never exits (stuck after completion). */
+function makeHangingSpawn(events, { trackKills = false } = {}) {
+  return function fakeSpawn(bin, args, options) {
+    spawnCalls.push({ bin, args, options });
+    const stdoutL = [];
+    const child = {
+      stdin: { write(d) { stdinWrites.push(String(d)); }, end() {}, on() {} },
+      stdout: { setEncoding() {}, on(e, f) { if (e === "data") stdoutL.push(f); }, once() {}, off() {} },
+      stderr: { setEncoding() {}, on() {} },
+      on() {},
+      kill() { if (trackKills) killCalls.push(1); },
+    };
+    if (events) {
+      setTimeout(() => {
+        for (const fn of stdoutL) {
+          fn(events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+        }
+      }, 5);
+    }
+    return child;
+  };
+}
+
+/** Race a collection against a deadline so a regression fails, not hangs. */
+async function collectWithin(options, spawnImpl, extraConfig, ms, label) {
+  const running = collect(options, spawnImpl, extraConfig);
+  return Promise.race([
+    running,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label}: stream did not settle within ${ms}ms`)), ms),
+    ),
+  ]);
 }
 
 /** Enforce the llm/stream invariant grammar over emitted chunks. */
@@ -297,5 +333,73 @@ assertInvariant(abortChunks, "abort");
 const aFinish = abortChunks.find((c) => c.type === "finish");
 assert.equal(aFinish?.reason?.kind, "aborted", "abort -> aborted finish");
 
-console.log("ALL 6 SCENARIOS PASSED (incl. llm/stream invariant grammar)");
-console.log("1 happy | 2 multi-block indices | 3 reconnect survives | 4 turn.failed | 5 empty | 6 abort");
+// ---------- 7. turn.completed settles the stream even if the process never exits ----------
+// Regression for "text streamed but the turn stays running": codex 0.15x
+// emits all items + turn.completed then lingers (app-server/MCP teardown).
+// The stream must terminate at turn.completed, not wait for process exit.
+const completedChunks = await collectWithin(
+  { ...baseOptions, messages: [{ role: "user", content: [{ type: "text", text: "背一下99乘法表" }] }] },
+  makeHangingSpawn([
+    { type: "thread.started", thread_id: "th_7" },
+    { type: "turn.started" },
+    { type: "item.completed", item: { id: "ag_1", type: "agent_message", text: "九九八十一" } },
+    { type: "turn.completed", usage: { input_tokens: 11, output_tokens: 7 } },
+  ]),
+  { noOutputTimeoutMs: 0, stallTimeoutMs: 0 },
+  2000,
+  "completed-terminates",
+);
+assertInvariant(completedChunks, "completed-terminates");
+const cText = completedChunks
+  .filter((c) => c.type === "text-delta").map((c) => c.text).join("");
+assert.equal(cText, "九九八十一", "text delivered before completion");
+const cFinish = completedChunks.find((c) => c.type === "finish");
+assert.equal(cFinish?.reason?.kind, "stop", "finish stop without process exit");
+assert.equal(
+  completedChunks.find((c) => c.type === "usage")?.usage?.outputTokens, 7,
+  "usage recorded from turn.completed",
+);
+
+// ---------- 8. no-output watchdog: silent codex (never emits, never exits) ----------
+// Guard for "runs in background forever": a codex exec that produces nothing
+// (e.g. retrying a dead upstream) must surface a visible error promptly.
+const noOutputKillsBefore = killCalls.length;
+const noOutputChunks = await collectWithin(
+  baseOptions,
+  makeHangingSpawn(null, { trackKills: true }),
+  { noOutputTimeoutMs: 60, stallTimeoutMs: 0 },
+  2000,
+  "no-output-watchdog",
+);
+assertInvariant(noOutputChunks, "no-output-watchdog");
+const nFinish = noOutputChunks.find((c) => c.type === "finish");
+assert.equal(nFinish?.reason?.kind, "error", "no output -> error finish");
+assert.equal(nFinish?.reason?.failure?.code, "UPSTREAM_TIMEOUT");
+assert.match(nFinish?.reason?.failure?.message ?? "", /no output/, "timeout message");
+assert.ok(killCalls.length > noOutputKillsBefore, "watchdog killed the stuck child");
+
+// ---------- 9. stall watchdog: text arrived, then codex goes silent ----------
+// Guard for mid-stream upstream drops: once output started, a long silence
+// must surface as an error instead of leaving the turn running forever.
+const stallKillsBefore = killCalls.length;
+const stallChunks = await collectWithin(
+  baseOptions,
+  makeHangingSpawn([
+    { type: "thread.started", thread_id: "th_9" },
+    { type: "turn.started" },
+    { type: "item.completed", item: { id: "ag_1", type: "agent_message", text: "一半" } },
+    // no turn.completed, no further events, no exit: upstream stalled
+  ], { trackKills: true }),
+  { noOutputTimeoutMs: 0, stallTimeoutMs: 60 },
+  2000,
+  "stall-watchdog",
+);
+assertInvariant(stallChunks, "stall-watchdog");
+const sFinish = stallChunks.find((c) => c.type === "finish");
+assert.equal(sFinish?.reason?.kind, "error", "stall -> error finish");
+assert.equal(sFinish?.reason?.failure?.code, "UPSTREAM_TIMEOUT");
+assert.match(sFinish?.reason?.failure?.message ?? "", /no codex events/, "stall message");
+assert.ok(killCalls.length > stallKillsBefore, "stall watchdog killed the stuck child");
+
+console.log("ALL 9 SCENARIOS PASSED (incl. llm/stream invariant grammar)");
+console.log("1 happy | 2 multi-block indices | 3 reconnect survives | 4 turn.failed | 5 empty | 6 abort | 7 completed-terminates | 8 no-output watchdog | 9 stall watchdog");

@@ -503,6 +503,14 @@ export async function* streamCodexExec(options, config) {
           ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
           ...(reasoningOut > 0 ? { reasoningTokens: reasoningOut } : {}),
         };
+        // `turn.completed` is the authoritative end of the response: every
+        // item has already been emitted (item.completed for the final
+        // agent_message precedes it). Terminate here instead of waiting for
+        // the codex process to exit — codex 0.15x lingers after the turn
+        // (app-server / MCP / remote-control teardown), which previously left
+        // the harness turn stuck in "running" even though all text had
+        // streamed. Killed in the generator's finally block.
+        queue.push({ kind: "terminal" });
         return;
       }
       case "turn.failed": {
@@ -557,7 +565,50 @@ export async function* streamCodexExec(options, config) {
   }
 
   let aborted = false;
-  let terminal = false; // turn.failed seen; no further content is expected
+  let terminal = false; // turn.failed / turn.completed seen; no further content is expected
+
+  // Watchdogs: codex should emit something promptly after spawn (no-output)
+  // and keep emitting periodically once it started (stall). Both turn an
+  // otherwise silent hang — e.g. the CLI retrying a dead upstream with
+  // "UnboundedConnectionRetries" — into a visible error instead of leaving
+  // the harness turn running forever. A value of `0` disables that timer.
+  const noOutputTimeoutMs = config.noOutputTimeoutMs ?? 120_000;
+  const stallTimeoutMs = config.stallTimeoutMs ?? 300_000;
+  let noOutputTimer = null;
+  let stallTimer = null;
+
+  function failStream(message, code) {
+    if (queue.closed) return; // already settling; never double-finish
+    queue.push({ kind: "fatal", failure: { message, code } });
+    try {
+      child.kill();
+    } catch {}
+  }
+
+  function armNoOutput() {
+    if (noOutputTimeoutMs <= 0) return;
+    noOutputTimer = setTimeout(() => {
+      noOutputTimer = null;
+      failStream(
+        `codex-bridge: codex produced no output within ${noOutputTimeoutMs}ms — the upstream configured in ~/.codex/config.toml (base_url) may be down or retrying`,
+        "UPSTREAM_TIMEOUT",
+      );
+    }, noOutputTimeoutMs);
+  }
+
+  function armStall() {
+    if (stallTimeoutMs <= 0) return;
+    if (stallTimer !== null) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      stallTimer = null;
+      failStream(
+        `codex-bridge: no codex events for ${stallTimeoutMs}ms after output started — upstream stalled`,
+        "UPSTREAM_TIMEOUT",
+      );
+    }, stallTimeoutMs);
+  }
+
+  armNoOutput();
 
   try {
     while (true) {
@@ -576,11 +627,18 @@ export async function* streamCodexExec(options, config) {
         break;
       }
       if (value.kind === "chunks") {
+        if (noOutputTimer !== null) {
+          clearTimeout(noOutputTimer);
+          noOutputTimer = null;
+        }
+        armStall();
         for (const chunk of value.chunks) yield chunk;
       }
     }
   } finally {
     signal?.removeEventListener("abort", onAbort);
+    if (noOutputTimer !== null) clearTimeout(noOutputTimer);
+    if (stallTimer !== null) clearTimeout(stallTimer);
     if (exitCode === null) {
       try {
         child.kill();

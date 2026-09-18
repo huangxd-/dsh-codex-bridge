@@ -41,7 +41,22 @@ function resolveConfig(raw) {
     defaultReasoningEffort: CODEX_EFFORTS.includes(config.defaultReasoningEffort)
       ? config.defaultReasoningEffort
       : "high",
+    // Watchdog windows (ms): codex should emit within noOutputTimeoutMs of
+    // spawn, and keep emitting at least every stallTimeoutMs once started.
+    // `0` disables the respective watchdog. Guards against silent hangs
+    // (e.g. the CLI retrying a dead upstream forever) that would otherwise
+    // leave the harness turn stuck in "running" with no output or error.
+    noOutputTimeoutMs: clampTimeout(config.noOutputTimeoutMs, 120_000),
+    stallTimeoutMs: clampTimeout(config.stallTimeoutMs, 300_000),
   };
+}
+
+/** Timeout value in ms; 0 disables, non-positive/absent falls back. */
+function clampTimeout(raw, fallback) {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw > 0 ? Math.floor(raw) : 0;
+  }
+  return fallback;
 }
 
 /** Create the LlmAdapter for the `codex` provider route. */
