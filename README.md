@@ -2,12 +2,12 @@
 
 [中文](README.zh.md) | English
 
-Use your locally logged-in **Codex CLI** as a model provider inside DeepSeek Harness (DSH). No re-login, no API key setup — the plugin drives `codex exec --json --ephemeral` so authentication, model access, quotas and reasoning all come from your existing `codex` login.
+Use your locally logged-in **Codex CLI** as a model provider inside DeepSeek Harness (DSH). No re-login, no API key setup — the plugin drives Codex's app-server delta protocol by default, so authentication, model access, quotas and reasoning all come from your existing `codex` login.
 
 ## What it does
 
 - Registers a `codex` provider route in DSH's Models page
-- Streams `text-delta` / `reasoning-delta` / `usage` chunks from codex's JSONL event stream
+- Streams real incremental `text-delta` / `reasoning-delta` / `usage` chunks from app-server notifications
 - Advertises the models your CLI can use (from `~/.codex/config.toml` + CC-Switch catalog)
 - Maps DSH reasoning-effort selection to `codex exec` `-c model_reasoning_effort`
 - Never reads, stores or forwards credentials — codex owns auth entirely
@@ -34,7 +34,8 @@ The plugin works with zero configuration. Optional settings live in your profile
 | Field | Default | Meaning |
 |---|---|---|
 | `codexBin` | auto-resolved | Path to the codex executable (resolves the vendored `.exe` behind npm shims on Windows) |
-| `sandboxMode` | `workspace-write` | Codex sandbox for the spawned exec: `workspace-write` (can edit files under `cwd`), `read-only` (cannot modify any file), `danger-full-access` (no sandbox) |
+| `sandboxMode` | `workspace-write` | Codex sandbox: `workspace-write` (can edit files under `cwd`), `read-only` (cannot modify any file), `danger-full-access` (no sandbox) |
+| `transport` | `app-server` | `app-server` provides true text/reasoning deltas; `exec` keeps the legacy completed-item `codex exec --json` compatibility mode |
 | `cwd` | current DSH session workspace | Working directory passed to codex **and** its working root (`-C`). Normally inferred from DSH's session context; an explicit value is a fixed override |
 | `addDirs` | `[]` | Extra directories made writable alongside `cwd` (passed as `--add-dir`), e.g. a sibling package or a shared lib |
 | `defaultReasoningEffort` | `high` | Effort used when a request doesn't select one: `low`/`medium`/`high`/`xhigh`/`none` |
@@ -49,6 +50,7 @@ Example:
       name: dsh-codex-bridge
       config:
         sandboxMode: workspace-write
+        transport: app-server
         cwd: D:/repos/my-project
         addDirs:
           - D:/repos/shared-lib
@@ -59,25 +61,25 @@ Example:
 
 ### Letting codex modify files
 
-`codex exec` is non-interactive, so the **sandbox flag alone decides whether codex may write**. `read-only` (the old default) permits no edits at all; the bridge now defaults to `workspace-write`:
+The bridge is non-interactive and starts turns with approval policy `never`, so the **sandbox setting decides whether codex may write**. `read-only` (the old default) permits no edits at all; the bridge now defaults to `workspace-write`:
 
-- **`workspace-write` (default)** — codex may create/edit/delete files inside its working root (`cwd`, plus every `addDirs` entry). Writes outside that root are denied, with no prompt (there is no approval channel in `exec`).
+- **`workspace-write` (default)** — codex may create/edit/delete files inside its working root (`cwd`, plus every `addDirs` entry). Writes outside that root are denied without an interactive prompt.
 - **`read-only`** — set this when you want codex to answer/analyze only and never touch the disk.
 - **`danger-full-access`** — no sandbox at all; codex may write anywhere the user account can. Only for environments you already isolate.
 
 Two things to check if codex still reports it cannot write:
 
-1. **Make sure the DSH session workspace is correct.** The bridge automatically reads the current session directory from DSH's trusted system context and passes it to `codex exec -C`. It falls back to the host process directory only on older DSH versions that do not provide that context. Set `cwd` explicitly when you want a fixed override.
+1. **Make sure the DSH session workspace is correct.** The bridge automatically reads the current session directory from DSH's trusted system context and passes it to app-server's `thread/start`. It falls back to the host process directory only on older DSH versions that do not provide that context. Set `cwd` explicitly when you want a fixed override.
 2. **Paths outside `cwd` need `addDirs`** (or a wider `sandboxMode`), because `workspace-write` protects everything outside the working root.
 
 ## How it works
 
 1. DSH's agent loop builds a request and selects the `codex` provider
 2. The adapter renders the conversation history (system + prior turns + latest user message) as one prompt
-3. It spawns `codex exec --json --ephemeral --skip-git-repo-check -s workspace-write -C <cwd> [--add-dir <dir>] -m <model>` and writes the prompt to stdin
-4. Codex's JSONL events (`item.completed` `agent_message`/`reasoning`, `turn.completed` usage) are translated to harness StreamChunks in real time
+3. It starts `codex app-server --listen stdio://`, creates an ephemeral thread, and supplies the session workspace, extra writable roots, sandbox and model settings through `thread/start` / `turn/start`
+4. App-server's `item/agentMessage/delta`, `item/reasoning/*Delta`, and token-usage notifications are translated into DSH StreamChunks as they arrive
 5. Blocks close, usage is reported, and the stream finishes — exactly like any other DSH model provider
-6. **The stream terminates as soon as `turn.completed` arrives** (it no longer waits for the codex process to exit), and two watchdogs cover silent hangs
+6. **The stream terminates as soon as `turn/completed` arrives** (without waiting for app-server to exit), and two watchdogs cover silent hangs
 
 ## Known limitations
 

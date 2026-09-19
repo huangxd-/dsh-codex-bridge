@@ -1,8 +1,9 @@
 /**
  * dsh-codex-bridge: mount the locally logged-in Codex CLI as a DSH model
- * provider. The `codex` provider route drives `codex exec --json --ephemeral`
- * per request, so authentication, model access and quotas come from the
- * user's existing CLI login — no re-login, no credentials handled here.
+ * provider. The `codex` provider route drives an ephemeral Codex app-server
+ * thread per request (with legacy exec JSONL fallback), so authentication,
+ * model access and quotas come from the user's existing CLI login — no
+ * re-login and no credentials handled here.
  *
  * Composition (cordis.patch.yml):
  *   - insert:
@@ -24,6 +25,7 @@ export const name = "llm-codex-bridge";
 export const inject = ["llm"];
 
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
+const TRANSPORTS = ["app-server", "exec"];
 
 /** Merge user config over defaults; tolerates a missing config object. */
 export function resolveConfig(raw) {
@@ -40,6 +42,12 @@ export function resolveConfig(raw) {
     sandboxMode: SANDBOX_MODES.includes(config.sandboxMode)
       ? config.sandboxMode
       : "workspace-write",
+    // app-server exposes real token/message delta notifications. The legacy
+    // exec JSONL stream generally publishes assistant text only when an item
+    // completes, which makes the DSH response appear in large bursts.
+    transport: TRANSPORTS.includes(config.transport)
+      ? config.transport
+      : "app-server",
     cwd: typeof config.cwd === "string" && config.cwd.length > 0
       ? config.cwd
       : undefined,

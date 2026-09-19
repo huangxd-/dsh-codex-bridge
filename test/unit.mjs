@@ -45,9 +45,108 @@ function makeFakeSpawn({ events, exitCode = 0 } = {}) {
   };
 }
 
+/** Fake line-delimited JSON-RPC app-server with true message deltas. */
+function makeFakeAppServerSpawn(requests) {
+  return function fakeAppServerSpawn(bin, args, options) {
+    spawnCalls.push({ bin, args, options });
+    const stdoutL = [];
+    const closeL = [];
+    let inputBuffer = "";
+    const emit = (message) => {
+      const line = `${JSON.stringify(message)}\n`;
+      for (const fn of stdoutL) fn(line);
+    };
+    const child = {
+      stdin: {
+        write(data) {
+          inputBuffer += String(data);
+          let newline;
+          while ((newline = inputBuffer.indexOf("\n")) !== -1) {
+            const line = inputBuffer.slice(0, newline);
+            inputBuffer = inputBuffer.slice(newline + 1);
+            if (line.trim().length === 0) continue;
+            const request = JSON.parse(line);
+            requests.push(request);
+            if (request.method === "initialize") {
+              emit({ id: request.id, result: { userAgent: "fake-codex" } });
+            } else if (request.method === "thread/start") {
+              emit({ id: request.id, result: { thread: { id: "thread_1" } } });
+            } else if (request.method === "turn/start") {
+              emit({ id: request.id, result: { turn: { id: "turn_1" } } });
+              setTimeout(() => {
+                emit({
+                  method: "item/reasoning/summaryTextDelta",
+                  params: { threadId: "thread_1", turnId: "turn_1", itemId: "rs_1", summaryIndex: 0, delta: "思" },
+                });
+                emit({
+                  method: "item/reasoning/summaryTextDelta",
+                  params: { threadId: "thread_1", turnId: "turn_1", itemId: "rs_1", summaryIndex: 0, delta: "考" },
+                });
+                emit({
+                  method: "item/agentMessage/delta",
+                  params: { threadId: "thread_1", turnId: "turn_1", itemId: "ag_1", delta: "你" },
+                });
+                emit({
+                  method: "item/agentMessage/delta",
+                  params: { threadId: "thread_1", turnId: "turn_1", itemId: "ag_1", delta: "好" },
+                });
+                emit({
+                  method: "thread/tokenUsage/updated",
+                  params: {
+                    threadId: "thread_1",
+                    turnId: "turn_1",
+                    tokenUsage: {
+                      last: {
+                        totalTokens: 15,
+                        inputTokens: 10,
+                        cachedInputTokens: 2,
+                        cacheWriteInputTokens: 0,
+                        outputTokens: 5,
+                        reasoningOutputTokens: 2,
+                      },
+                    },
+                  },
+                });
+                const items = [
+                  { type: "reasoning", id: "rs_1", summary: ["思考"], content: [] },
+                  { type: "agentMessage", id: "ag_1", text: "你好" },
+                ];
+                for (const item of items) {
+                  emit({
+                    method: "item/completed",
+                    params: { threadId: "thread_1", turnId: "turn_1", item },
+                  });
+                }
+                emit({
+                  method: "turn/completed",
+                  params: {
+                    threadId: "thread_1",
+                    turn: { id: "turn_1", status: "completed", items, error: null },
+                  },
+                });
+              }, 5);
+            }
+          }
+        },
+        end() {},
+        on() {},
+      },
+      stdout: {
+        setEncoding() {},
+        on(event, fn) { if (event === "data") stdoutL.push(fn); },
+      },
+      stderr: { setEncoding() {}, on() {} },
+      on(event, fn) { if (event === "close") closeL.push(fn); },
+      kill() {},
+    };
+    return child;
+  };
+}
+
 async function collect(options, spawnImpl, extraConfig = {}) {
   const chunks = [];
   for await (const chunk of streamCodexExec(options, {
+    transport: "exec",
     sandboxMode: "read-only",
     defaultReasoningEffort: "high",
     codexBin: "fake-codex",
@@ -325,7 +424,7 @@ const hangingSpawn = function (bin, args, options) {
 const abortChunks = [];
 for await (const chunk of streamCodexExec(
   { ...baseOptions, signal: abortController.signal },
-  { sandboxMode: "read-only", defaultReasoningEffort: "high", codexBin: "fake-codex", spawnImpl: hangingSpawn },
+  { transport: "exec", sandboxMode: "read-only", defaultReasoningEffort: "high", codexBin: "fake-codex", spawnImpl: hangingSpawn },
 )) {
   abortChunks.push(chunk);
 }
@@ -412,6 +511,12 @@ assert.ok(killCalls.length > stallKillsBefore, "stall watchdog killed the stuck 
     defaults.sandboxMode, "workspace-write",
     "default sandbox allows writes inside the working root",
   );
+  assert.equal(defaults.transport, "app-server",
+    "default transport exposes true incremental deltas");
+  assert.equal(resolveConfig({ transport: "exec" }).transport, "exec",
+    "legacy exec transport remains available");
+  assert.equal(resolveConfig({ transport: "bogus" }).transport, "app-server",
+    "invalid transport falls back to app-server");
   assert.deepEqual(defaults.addDirs, [], "no extra writable dirs by default");
   assert.equal(resolveConfig({ sandboxMode: "read-only" }).sandboxMode, "read-only",
     "read-only opt-out honored");
@@ -512,5 +617,68 @@ assert.ok(killCalls.length > stallKillsBefore, "stall watchdog killed the stuck 
     "explicit plugin cwd overrides the inferred DSH session directory");
 }
 
-console.log("ALL 10 SCENARIOS PASSED (incl. llm/stream invariant grammar)");
-console.log("1 happy | 2 multi-block indices | 3 reconnect survives | 4 turn.failed | 5 empty | 6 abort | 7 completed-terminates | 8 no-output watchdog | 9 stall watchdog | 10 sandbox/working-root flags");
+// ---------- 11. app-server transport emits true incremental deltas ----------
+{
+  const appServerRequests = [];
+  const appServerSpawnCalls = spawnCalls.length;
+  const projectDir = "D:\\repos\\stream-project";
+  const appServerChunks = [];
+  for await (const chunk of streamCodexExec(
+    {
+      ...baseOptions,
+      system: undefined,
+      messages: [
+        {
+          role: "system",
+          content: [{ type: "text", text: `Your working directory is ${projectDir}.` }],
+        },
+        { role: "user", content: [{ type: "text", text: "say hello" }] },
+      ],
+    },
+    {
+      transport: "app-server",
+      sandboxMode: "workspace-write",
+      defaultReasoningEffort: "high",
+      codexBin: "fake-codex",
+      spawnImpl: makeFakeAppServerSpawn(appServerRequests),
+      addDirs: ["D:\\repos\\shared"],
+      noOutputTimeoutMs: 1000,
+      stallTimeoutMs: 1000,
+    },
+  )) {
+    appServerChunks.push(chunk);
+  }
+  assertInvariant(appServerChunks, "app-server-streaming");
+  assert.deepEqual(
+    appServerChunks.filter((c) => c.type === "text-delta").map((c) => c.text),
+    ["你", "好"],
+    "app-server forwards agent message deltas without waiting for item completion",
+  );
+  assert.deepEqual(
+    appServerChunks.filter((c) => c.type === "reasoning-delta").map((c) => c.text),
+    ["思", "考"],
+    "app-server forwards reasoning deltas",
+  );
+  const appUsage = appServerChunks.find((c) => c.type === "usage")?.usage;
+  assert.equal(appUsage?.inputTokens, 8, "app-server usage excludes cached input");
+  assert.equal(appUsage?.outputTokens, 5, "app-server usage output");
+  const appCall = spawnCalls[appServerSpawnCalls];
+  assert.deepEqual(appCall.args, ["app-server", "--listen", "stdio://"]);
+  assert.equal(appCall.options.cwd, projectDir);
+  const initialize = appServerRequests.find((request) => request.method === "initialize");
+  assert.equal(initialize?.params?.capabilities?.experimentalApi, true,
+    "runtime workspace roots opt into the gated app-server capability");
+  const threadStart = appServerRequests.find((request) => request.method === "thread/start");
+  assert.equal(threadStart?.params?.cwd, projectDir);
+  assert.deepEqual(
+    threadStart?.params?.runtimeWorkspaceRoots,
+    [projectDir, "D:\\repos\\shared"],
+  );
+  assert.equal(threadStart?.params?.sandbox, "workspace-write");
+  assert.equal(threadStart?.params?.approvalPolicy, "never");
+  const turnStart = appServerRequests.find((request) => request.method === "turn/start");
+  assert.equal(turnStart?.params?.effort, "high");
+}
+
+console.log("ALL 11 SCENARIOS PASSED (incl. llm/stream invariant grammar)");
+console.log("1 happy | 2 multi-block indices | 3 reconnect survives | 4 turn.failed | 5 empty | 6 abort | 7 completed-terminates | 8 no-output watchdog | 9 stall watchdog | 10 sandbox/working-root flags | 11 app-server true deltas");

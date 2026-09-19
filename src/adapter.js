@@ -1,7 +1,7 @@
 /**
- * Codex CLI bridge adapter: drives the locally logged-in `codex` binary in
- * `exec --json` mode and maps its JSONL event stream onto the harness
- * StreamChunk vocabulary.
+ * Codex CLI bridge adapter: drives the locally logged-in `codex` binary via
+ * app-server (true deltas) or legacy `exec --json`, and maps its event stream
+ * onto the harness StreamChunk vocabulary.
  *
  * Authentication, model access, quotas and the codex toolchain are all owned
  * by the user's existing CLI login ($CODEX_HOME). This adapter never reads,
@@ -377,6 +377,11 @@ class Queue {
  *   error {message}
  */
 export async function* streamCodexExec(options, config) {
+  if ((config.transport ?? "app-server") === "app-server") {
+    yield* streamCodexAppServer(options, config);
+    return;
+  }
+
   let prompt;
   try {
     prompt = renderPrompt(options);
@@ -750,6 +755,471 @@ export async function* streamCodexExec(options, config) {
           ? `codex exec exited with code ${exitCode}${stderr ? `: ${stderr}` : ""}`
           : "codex returned a completed turn with no content",
       code,
+    });
+    return;
+  }
+  yield { type: "finish", reason: { kind: "stop" } };
+}
+
+/**
+ * Stream one turn through `codex app-server`.
+ *
+ * Unlike `codex exec --json`, app-server exposes the model's actual delta
+ * notifications, so DSH can paint text and reasoning while they are being
+ * generated instead of waiting for each completed item.
+ */
+async function* streamCodexAppServer(options, config) {
+  let prompt;
+  try {
+    prompt = renderPrompt(options);
+  } catch (error) {
+    yield terminalFailure({
+      message: String(error?.message ?? error),
+      code: "INVALID_ARGS",
+    });
+    return;
+  }
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    yield terminalFailure({
+      message: `codex-bridge: prompt of ${prompt.length} chars exceeds the ${MAX_PROMPT_CHARS} char limit`,
+      code: "INVALID_ARGS",
+    });
+    return;
+  }
+
+  const cwd = resolveWorkingDirectory(options, config);
+  const processCwd = cwd ?? process.cwd();
+  const codexBin = resolveCodexBinary(config.codexBin);
+  const spawnFn = config.spawnImpl ?? spawn;
+  const queue = new Queue();
+  const pending = new Map();
+  let nextRequestId = 1;
+  let child;
+  let stdoutBuffer = "";
+  let stderrTail = "";
+  let exitCode = null;
+  let aborted = false;
+  let terminal = false;
+  let fatalFailure;
+  let usage;
+  let sawText = false;
+  let sawReasoning = false;
+  let nextIndex = 0;
+  const blocks = new Map();
+  const noOutputTimeoutMs = config.noOutputTimeoutMs ?? 120_000;
+  const stallTimeoutMs = config.stallTimeoutMs ?? 300_000;
+  let noOutputTimer = null;
+  let stallTimer = null;
+
+  function failStream(message, code) {
+    if (queue.closed) return;
+    queue.push({ kind: "fatal", failure: { message, code } });
+    try {
+      child?.kill();
+    } catch {}
+  }
+
+  function armNoOutput() {
+    if (noOutputTimeoutMs <= 0) return;
+    if (noOutputTimer !== null) clearTimeout(noOutputTimer);
+    noOutputTimer = setTimeout(() => {
+      noOutputTimer = null;
+      failStream(
+        `codex-bridge: codex app-server produced no model output within ${noOutputTimeoutMs}ms`,
+        "UPSTREAM_TIMEOUT",
+      );
+    }, noOutputTimeoutMs);
+  }
+
+  function armStall() {
+    if (stallTimeoutMs <= 0) return;
+    if (stallTimer !== null) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      stallTimer = null;
+      failStream(
+        `codex-bridge: no codex app-server events for ${stallTimeoutMs}ms after output started`,
+        "UPSTREAM_TIMEOUT",
+      );
+    }, stallTimeoutMs);
+  }
+
+  function pushChunks(chunks) {
+    if (noOutputTimer !== null) {
+      clearTimeout(noOutputTimer);
+      noOutputTimer = null;
+    }
+    armStall();
+    queue.push({ kind: "chunks", chunks });
+  }
+
+  function ensureBlock(key, blockType) {
+    let state = blocks.get(key);
+    if (state === undefined) {
+      state = { index: nextIndex++, blockType, emitted: "", closed: false };
+      blocks.set(key, state);
+      pushChunks([{ type: "block-start", index: state.index, blockType }]);
+    }
+    return state;
+  }
+
+  function appendDelta(key, blockType, delta) {
+    if (typeof delta !== "string" || delta.length === 0) return;
+    const state = ensureBlock(key, blockType);
+    if (state.closed) return;
+    state.emitted += delta;
+    pushChunks([{
+      type: blockType === "text" ? "text-delta" : "reasoning-delta",
+      index: state.index,
+      text: delta,
+    }]);
+    if (blockType === "text") sawText = true;
+    else sawReasoning = true;
+  }
+
+  function completeBlock(key, blockType, fullText) {
+    const text = typeof fullText === "string" ? fullText : "";
+    let state = blocks.get(key);
+    if (state === undefined && text.length === 0) return;
+    state = ensureBlock(key, blockType);
+    if (state.closed) return;
+    if (text.length > state.emitted.length) {
+      const remainder = text.startsWith(state.emitted)
+        ? text.slice(state.emitted.length)
+        : text;
+      appendDelta(key, blockType, remainder);
+    }
+    state.closed = true;
+    pushChunks([{
+      type: "block-end",
+      index: state.index,
+      block: { type: blockType, text: text || state.emitted },
+    }]);
+  }
+
+  function completeItem(item) {
+    if (!item || typeof item.id !== "string") return;
+    if (item.type === "agentMessage") {
+      completeBlock(`agent:${item.id}`, "text", item.text);
+      return;
+    }
+    if (item.type !== "reasoning") return;
+    const summary = Array.isArray(item.summary) ? item.summary : [];
+    const content = Array.isArray(item.content) ? item.content : [];
+    summary.forEach((text, index) =>
+      completeBlock(`reasoning-summary:${item.id}:${index}`, "reasoning", text));
+    content.forEach((text, index) =>
+      completeBlock(`reasoning-content:${item.id}:${index}`, "reasoning", text));
+    for (const [key, state] of blocks) {
+      if (!key.includes(`:${item.id}:`) || state.closed) continue;
+      completeBlock(key, "reasoning", state.emitted);
+    }
+  }
+
+  function updateUsage(raw) {
+    const last = raw?.last;
+    if (!last || typeof last !== "object") return;
+    const input = safeCount(last.inputTokens);
+    const cached = safeCount(last.cachedInputTokens);
+    const cacheWrite = safeCount(last.cacheWriteInputTokens);
+    const output = safeCount(last.outputTokens);
+    const reasoningOut = safeCount(last.reasoningOutputTokens);
+    usage = {
+      inputTokens: Math.max(0, input - cached),
+      outputTokens: output,
+      totalTokens: safeCount(last.totalTokens) || input + output,
+      ...(cached > 0 ? { cacheReadTokens: cached } : {}),
+      ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
+      ...(reasoningOut > 0 ? { reasoningTokens: reasoningOut } : {}),
+    };
+  }
+
+  function handleNotification(message) {
+    const params = message?.params ?? {};
+    switch (message?.method) {
+      case "item/agentMessage/delta":
+        appendDelta(`agent:${params.itemId}`, "text", params.delta);
+        return;
+      case "item/reasoning/summaryTextDelta":
+        appendDelta(
+          `reasoning-summary:${params.itemId}:${safeCount(params.summaryIndex)}`,
+          "reasoning",
+          params.delta,
+        );
+        return;
+      case "item/reasoning/textDelta":
+        appendDelta(
+          `reasoning-content:${params.itemId}:${safeCount(params.contentIndex)}`,
+          "reasoning",
+          params.delta,
+        );
+        return;
+      case "item/completed":
+        completeItem(params.item);
+        return;
+      case "thread/tokenUsage/updated":
+        updateUsage(params.tokenUsage);
+        return;
+      case "error":
+        if (!params.willRetry) {
+          fatalFailure = {
+            message: params.error?.message ?? "codex app-server turn failed",
+            code: "UPSTREAM_ERROR",
+          };
+          queue.push({ kind: "terminal" });
+        }
+        return;
+      case "turn/completed": {
+        for (const item of params.turn?.items ?? []) completeItem(item);
+        if (params.turn?.status === "failed") {
+          fatalFailure = {
+            message: params.turn?.error?.message ?? "codex app-server turn failed",
+            code: "UPSTREAM_ERROR",
+          };
+        } else if (params.turn?.status === "interrupted") {
+          aborted = true;
+        }
+        queue.push({ kind: "terminal" });
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  function rejectPending(error) {
+    for (const { reject } of pending.values()) reject(error);
+    pending.clear();
+  }
+
+  function sendMessage(message) {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  function sendRequest(method, params) {
+    const id = nextRequestId++;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      try {
+        sendMessage({ method, id, params });
+      } catch (error) {
+        pending.delete(id);
+        reject(error);
+      }
+    });
+  }
+
+  function dispatchLine(line) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) return;
+    let message;
+    try {
+      message = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+    if (message.id !== undefined && message.method === undefined) {
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id);
+      if (message.error !== undefined) {
+        waiter.reject(new Error(message.error?.message ?? "codex app-server request failed"));
+      } else {
+        waiter.resolve(message.result);
+      }
+      return;
+    }
+    if (message.id !== undefined && typeof message.method === "string") {
+      // This bridge has no interactive approval/input channel. Reject any
+      // unexpected server request explicitly so the turn cannot hang.
+      sendMessage({
+        id: message.id,
+        error: { code: -32601, message: "interactive server requests are not supported" },
+      });
+      return;
+    }
+    handleNotification(message);
+  }
+
+  function drainLines(final) {
+    let newlineIndex;
+    while ((newlineIndex = stdoutBuffer.indexOf("\n")) !== -1) {
+      const line = stdoutBuffer.slice(0, newlineIndex);
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      dispatchLine(line);
+    }
+    if (final && stdoutBuffer.trim().length > 0) {
+      dispatchLine(stdoutBuffer);
+      stdoutBuffer = "";
+    }
+  }
+
+  try {
+    child = spawnFn(codexBin, ["app-server", "--listen", "stdio://"], {
+      cwd: processCwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  } catch (error) {
+    yield terminalFailure({
+      message: `codex-bridge: failed to launch codex app-server at ${codexBin} (${String(error?.message ?? error)})`,
+      code: "INVALID_CREDENTIAL",
+    });
+    return;
+  }
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdoutBuffer += chunk;
+    drainLines(false);
+  });
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderrTail = (stderrTail + chunk).slice(-4000);
+  });
+  child.on("error", (error) => {
+    rejectPending(error);
+    failStream(
+      `codex-bridge: failed to launch codex app-server (${error.message})`,
+      "INVALID_CREDENTIAL",
+    );
+  });
+  child.on("close", (code) => {
+    exitCode = code;
+    drainLines(true);
+    rejectPending(new Error(`codex app-server exited with code ${code}`));
+    queue.push({ kind: "closed" });
+    queue.close();
+  });
+  child.stdin.on("error", () => {});
+
+  const signal = options.signal;
+  const onAbort = () => {
+    aborted = true;
+    try {
+      child.kill();
+    } catch {}
+    queue.push({ kind: "abort" });
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    await sendRequest("initialize", {
+      clientInfo: {
+        name: "dsh-codex-bridge",
+        title: "DSH Codex Bridge",
+        version: "0.1.0",
+      },
+      capabilities: {
+        // runtimeWorkspaceRoots (the app-server equivalent of --add-dir) is
+        // currently capability-gated even though the delta notifications are
+        // stable.
+        experimentalApi: true,
+        requestAttestation: false,
+      },
+    });
+    sendMessage({ method: "initialized" });
+
+    const roots = [processCwd, ...(config.addDirs ?? [])];
+    const thread = await sendRequest("thread/start", {
+      ...(options.model ? { model: options.model } : {}),
+      cwd: processCwd,
+      runtimeWorkspaceRoots: [...new Set(roots)],
+      approvalPolicy: "never",
+      sandbox: config.sandboxMode ?? "workspace-write",
+      ephemeral: true,
+      threadSource: "dsh-codex-bridge",
+    });
+    const threadId = thread?.thread?.id;
+    if (typeof threadId !== "string" || threadId.length === 0) {
+      throw new Error("codex app-server returned no thread id");
+    }
+    const effort = options.reasoningEffort ?? config.defaultReasoningEffort;
+    armNoOutput();
+    await sendRequest("turn/start", {
+      threadId,
+      input: [{ type: "text", text: prompt, text_elements: [] }],
+      ...(typeof effort === "string" && CODEX_EFFORTS.includes(effort)
+        ? { effort }
+        : {}),
+    });
+  } catch (error) {
+    signal?.removeEventListener("abort", onAbort);
+    if (noOutputTimer !== null) clearTimeout(noOutputTimer);
+    if (stallTimer !== null) clearTimeout(stallTimer);
+    if (exitCode === null) {
+      try {
+        child.kill();
+      } catch {}
+    }
+    yield terminalFailure({
+      message: `codex-bridge: app-server setup failed (${String(error?.message ?? error)})${stderrTail.trim() ? `: ${stderrTail.trim()}` : ""}`,
+      code: "UPSTREAM_ERROR",
+    });
+    return;
+  }
+
+  try {
+    while (true) {
+      const { value, done } = await queue.next();
+      if (done) break;
+      if (value.kind === "fatal") {
+        fatalFailure = value.failure;
+        break;
+      }
+      if (value.kind === "abort") {
+        aborted = true;
+        break;
+      }
+      if (value.kind === "terminal") {
+        terminal = true;
+        break;
+      }
+      if (value.kind === "chunks") {
+        for (const chunk of value.chunks) yield chunk;
+      }
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    if (noOutputTimer !== null) clearTimeout(noOutputTimer);
+    if (stallTimer !== null) clearTimeout(stallTimer);
+    rejectPending(new Error("codex app-server stream ended"));
+    if (exitCode === null) {
+      try {
+        child.kill();
+      } catch {}
+    }
+  }
+
+  for (const state of blocks.values()) {
+    if (state.closed) continue;
+    state.closed = true;
+    yield {
+      type: "block-end",
+      index: state.index,
+      block: { type: state.blockType, text: state.emitted },
+    };
+  }
+
+  if (aborted) {
+    yield { type: "finish", reason: { kind: "aborted" } };
+    return;
+  }
+  if (fatalFailure !== undefined) {
+    yield terminalFailure(fatalFailure);
+    return;
+  }
+  if (!terminal && exitCode !== null) {
+    yield terminalFailure({
+      message: `codex app-server exited with code ${exitCode}${stderrTail.trim() ? `: ${stderrTail.trim()}` : ""}`,
+      code: "UPSTREAM_ERROR",
+    });
+    return;
+  }
+  if (usage !== undefined) yield { type: "usage", usage };
+  if (!sawText && !sawReasoning) {
+    yield terminalFailure({
+      message: "codex app-server returned a completed turn with no content",
+      code: "EMPTY_RESPONSE",
     });
     return;
   }

@@ -2,12 +2,12 @@
 
 English | [中文](README.md)
 
-把本地**已登录的 Codex CLI** 接入 DeepSeek Harness（DSH）作为模型提供方。无需重新登录、无需配置 API Key——插件通过 `codex exec --json --ephemeral` 驱动真实 CLI，认证、模型权限、配额与推理能力全部复用你现有的 codex 登录状态。
+把本地**已登录的 Codex CLI** 接入 DeepSeek Harness（DSH）作为模型提供方。无需重新登录、无需配置 API Key——插件默认通过 Codex app-server 的增量事件协议驱动真实 CLI，认证、模型权限、配额与推理能力全部复用你现有的 codex 登录状态。
 
 ## 功能
 
 - 在 DSH 模型选择页注册 `codex` 提供方路由
-- 实时流式输出 `text-delta` / `reasoning-delta` / `usage`（来自 codex 的 JSONL 事件流）
+- 实时逐增量输出 `text-delta` / `reasoning-delta` / `usage`（来自 app-server 的 message/reasoning delta 通知）
 - 自动发现 CLI 可用的模型（读取 `~/.codex/config.toml` 与 CC-Switch 模型目录）
 - DSH 的推理强度选择映射到 `codex exec -c model_reasoning_effort`
 - 绝不读取、存储或转发凭据——认证完全由 codex CLI 自己管理
@@ -34,7 +34,8 @@ dsh plugin --profile web add D:/DshWorkspace/codex-bridge/dsh-codex-bridge
 | 字段 | 默认值 | 含义 |
 |---|---|---|
 | `codexBin` | 自动解析 | codex 可执行文件路径（Windows 下会自动解析 npm shim 背后的原生 `.exe`） |
-| `sandboxMode` | `workspace-write` | 传给 codex exec 的沙箱模式：`workspace-write`（可修改 `cwd` 内的文件）、`read-only`（完全不能改文件）、`danger-full-access`（不设沙箱） |
+| `sandboxMode` | `workspace-write` | Codex 沙箱模式：`workspace-write`（可修改 `cwd` 内的文件）、`read-only`（完全不能改文件）、`danger-full-access`（不设沙箱） |
+| `transport` | `app-server` | `app-server` 提供真正的文本/推理增量流；`exec` 保留旧版 `codex exec --json` 完成项事件兼容模式 |
 | `cwd` | DSH 当前会话工作目录 | 传给 codex 的工作目录，**同时**是它的工作根（`-C`）；通常自动从 DSH 会话上下文解析，显式配置时作为固定覆盖值 |
 | `addDirs` | `[]` | 除 `cwd` 之外额外可写的目录（对应 `--add-dir`），例如同级包或共享库 |
 | `defaultReasoningEffort` | `high` | 请求未指定时使用的推理强度：`low`/`medium`/`high`/`xhigh`/`none` |
@@ -49,6 +50,7 @@ dsh plugin --profile web add D:/DshWorkspace/codex-bridge/dsh-codex-bridge
       name: dsh-codex-bridge
       config:
         sandboxMode: workspace-write
+        transport: app-server
         cwd: D:/repos/my-project
         addDirs:
           - D:/repos/shared-lib
@@ -59,25 +61,25 @@ dsh plugin --profile web add D:/DshWorkspace/codex-bridge/dsh-codex-bridge
 
 ### 让 codex 能修改文件
 
-`codex exec` 是非交互模式，**能否写文件完全由沙箱参数决定**。`read-only`（旧版默认）一个字节都改不了；本插件现在默认 `workspace-write`：
+桥接器以非交互方式运行，并为 turn 设置 `never` 审批策略，因此**能否写文件由沙箱参数决定**。`read-only`（旧版默认）一个字节都改不了；本插件现在默认 `workspace-write`：
 
-- **`workspace-write`（默认）**——codex 可以在工作根（`cwd` 及每个 `addDirs`）内创建/修改/删除文件；根之外一律拒绝，且不会询问（`exec` 没有审批通道）。
+- **`workspace-write`（默认）**——codex 可以在工作根（`cwd` 及每个 `addDirs`）内创建/修改/删除文件；根之外一律拒绝，不会弹出交互式审批。
 - **`read-only`**——只想让它分析、绝不落盘时使用。
 - **`danger-full-access`**——完全不设沙箱，账号能写的地方它都能写；仅限你已隔离的环境。
 
 若 codex 仍报无法写入，检查两点：
 
-1. **确认 DSH 会话工作目录正确**。插件会自动从 DSH 的可信系统上下文读取当前会话目录并传给 `codex exec -C`；只有旧版 DSH 未提供该上下文时才回退到宿主进程目录。若要固定到某个目录，可显式配置 `cwd` 覆盖自动值。
+1. **确认 DSH 会话工作目录正确**。插件会自动从 DSH 的可信系统上下文读取当前会话目录并传给 app-server 的 `thread/start`；只有旧版 DSH 未提供该上下文时才回退到宿主进程目录。若要固定到某个目录，可显式配置 `cwd` 覆盖自动值。
 2. **`cwd` 之外的路径需要 `addDirs`**（或放宽 `sandboxMode`），因为 `workspace-write` 会保护工作根以外的一切。
 
 ## 工作原理
 
 1. DSH 的 agent loop 构建请求并选择 `codex` 提供方
 2. 适配器把会话历史（system + 历史对话 + 最新用户消息）渲染为单个 prompt
-3. 启动 `codex exec --json --ephemeral --skip-git-repo-check -s workspace-write -C <cwd> [--add-dir <目录>] -m <模型>`，prompt 写入 stdin
-4. codex 的 JSONL 事件（`item.completed` 的 `agent_message`/`reasoning`、`turn.completed` 的 usage）实时翻译为 DSH StreamChunk
+3. 启动 `codex app-server --listen stdio://`，创建临时线程，并将会话工作目录、额外可写目录、沙箱和模型参数写入 `thread/start` / `turn/start`
+4. app-server 的 `item/agentMessage/delta`、`item/reasoning/*Delta` 和 token usage 通知被逐条翻译为 DSH StreamChunk，因此生成中即可显示内容
 5. 关闭块、上报 usage、终止流——与其他 DSH 模型提供方完全一致
-6. **`turn.completed` 一到即终止流**（不等 codex 进程退出），并有两个看门狗兜底静默挂起
+6. **`turn/completed` 一到即终止流**（不等 app-server 进程退出），并有两个看门狗兜底静默挂起
 
 ## 已知限制
 
