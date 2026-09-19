@@ -34,8 +34,9 @@ The plugin works with zero configuration. Optional settings live in your profile
 | Field | Default | Meaning |
 |---|---|---|
 | `codexBin` | auto-resolved | Path to the codex executable (resolves the vendored `.exe` behind npm shims on Windows) |
-| `sandboxMode` | `read-only` | Codex sandbox for the spawned exec: `read-only`, `workspace-write`, `danger-full-access` |
-| `cwd` | process cwd | Working directory passed to codex exec |
+| `sandboxMode` | `workspace-write` | Codex sandbox for the spawned exec: `workspace-write` (can edit files under `cwd`), `read-only` (cannot modify any file), `danger-full-access` (no sandbox) |
+| `cwd` | current DSH session workspace | Working directory passed to codex **and** its working root (`-C`). Normally inferred from DSH's session context; an explicit value is a fixed override |
+| `addDirs` | `[]` | Extra directories made writable alongside `cwd` (passed as `--add-dir`), e.g. a sibling package or a shared lib |
 | `defaultReasoningEffort` | `high` | Effort used when a request doesn't select one: `low`/`medium`/`high`/`xhigh`/`none` |
 | `noOutputTimeoutMs` | `120000` | Watchdog: abort with `UPSTREAM_TIMEOUT` if codex emits nothing (no text, no events) within this many ms of spawn. `0` disables |
 | `stallTimeoutMs` | `300000` | Watchdog: abort with `UPSTREAM_TIMEOUT` if no event arrives for this long after output has started (stalled upstream). `0` disables |
@@ -47,24 +48,40 @@ Example:
     - id: llm-codex-bridge
       name: dsh-codex-bridge
       config:
-        sandboxMode: read-only
+        sandboxMode: workspace-write
+        cwd: D:/repos/my-project
+        addDirs:
+          - D:/repos/shared-lib
         defaultReasoningEffort: high
         noOutputTimeoutMs: 120000
         stallTimeoutMs: 300000
 ```
 
+### Letting codex modify files
+
+`codex exec` is non-interactive, so the **sandbox flag alone decides whether codex may write**. `read-only` (the old default) permits no edits at all; the bridge now defaults to `workspace-write`:
+
+- **`workspace-write` (default)** — codex may create/edit/delete files inside its working root (`cwd`, plus every `addDirs` entry). Writes outside that root are denied, with no prompt (there is no approval channel in `exec`).
+- **`read-only`** — set this when you want codex to answer/analyze only and never touch the disk.
+- **`danger-full-access`** — no sandbox at all; codex may write anywhere the user account can. Only for environments you already isolate.
+
+Two things to check if codex still reports it cannot write:
+
+1. **Make sure the DSH session workspace is correct.** The bridge automatically reads the current session directory from DSH's trusted system context and passes it to `codex exec -C`. It falls back to the host process directory only on older DSH versions that do not provide that context. Set `cwd` explicitly when you want a fixed override.
+2. **Paths outside `cwd` need `addDirs`** (or a wider `sandboxMode`), because `workspace-write` protects everything outside the working root.
+
 ## How it works
 
 1. DSH's agent loop builds a request and selects the `codex` provider
 2. The adapter renders the conversation history (system + prior turns + latest user message) as one prompt
-3. It spawns `codex exec --json --ephemeral --skip-git-repo-check -s read-only -m <model>` and writes the prompt to stdin
+3. It spawns `codex exec --json --ephemeral --skip-git-repo-check -s workspace-write -C <cwd> [--add-dir <dir>] -m <model>` and writes the prompt to stdin
 4. Codex's JSONL events (`item.completed` `agent_message`/`reasoning`, `turn.completed` usage) are translated to harness StreamChunks in real time
 5. Blocks close, usage is reported, and the stream finishes — exactly like any other DSH model provider
 6. **The stream terminates as soon as `turn.completed` arrives** (it no longer waits for the codex process to exit), and two watchdogs cover silent hangs
 
 ## Known limitations
 
-- **Codex runs as a full agent**: each request is a fresh ephemeral codex session. It may use its own built-in tools (shell, etc.) within the configured sandbox. The text it produces is returned as the assistant message; its tool activity is not projected into the DSH transcript.
+- **Codex runs as a full agent**: each request is a fresh ephemeral codex session. It may use its own built-in tools (shell, file edits, etc.) within the configured sandbox, so under the default `workspace-write` **it really does change files on disk** inside `cwd`/`addDirs`. The text it produces is returned as the assistant message; its tool activity and file changes are not projected into the DSH transcript or its diff view.
 - **Conversation history is re-sent as prompt text** each turn (robust across models, but no provider-side KV-cache reuse).
 - **Image input** is advertised only when the selected model supports it; DSH file/image blocks are currently rendered as handle text.
 

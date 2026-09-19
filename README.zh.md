@@ -34,8 +34,9 @@ dsh plugin --profile web add D:/DshWorkspace/codex-bridge/dsh-codex-bridge
 | 字段 | 默认值 | 含义 |
 |---|---|---|
 | `codexBin` | 自动解析 | codex 可执行文件路径（Windows 下会自动解析 npm shim 背后的原生 `.exe`） |
-| `sandboxMode` | `read-only` | 传给 codex exec 的沙箱模式：`read-only`、`workspace-write`、`danger-full-access` |
-| `cwd` | 进程工作目录 | codex exec 的工作目录 |
+| `sandboxMode` | `workspace-write` | 传给 codex exec 的沙箱模式：`workspace-write`（可修改 `cwd` 内的文件）、`read-only`（完全不能改文件）、`danger-full-access`（不设沙箱） |
+| `cwd` | DSH 当前会话工作目录 | 传给 codex 的工作目录，**同时**是它的工作根（`-C`）；通常自动从 DSH 会话上下文解析，显式配置时作为固定覆盖值 |
+| `addDirs` | `[]` | 除 `cwd` 之外额外可写的目录（对应 `--add-dir`），例如同级包或共享库 |
 | `defaultReasoningEffort` | `high` | 请求未指定时使用的推理强度：`low`/`medium`/`high`/`xhigh`/`none` |
 | `noOutputTimeoutMs` | `120000` | 看门狗：启动后这么久仍无任何输出（无文本、无事件）则中止并报错 `UPSTREAM_TIMEOUT`。`0` 关闭 |
 | `stallTimeoutMs` | `300000` | 看门狗：已有输出后这么久再无任何事件（上游断流挂起）则中止并报错 `UPSTREAM_TIMEOUT`。`0` 关闭 |
@@ -47,17 +48,33 @@ dsh plugin --profile web add D:/DshWorkspace/codex-bridge/dsh-codex-bridge
     - id: llm-codex-bridge
       name: dsh-codex-bridge
       config:
-        sandboxMode: read-only
+        sandboxMode: workspace-write
+        cwd: D:/repos/my-project
+        addDirs:
+          - D:/repos/shared-lib
         defaultReasoningEffort: high
         noOutputTimeoutMs: 120000
         stallTimeoutMs: 300000
 ```
 
+### 让 codex 能修改文件
+
+`codex exec` 是非交互模式，**能否写文件完全由沙箱参数决定**。`read-only`（旧版默认）一个字节都改不了；本插件现在默认 `workspace-write`：
+
+- **`workspace-write`（默认）**——codex 可以在工作根（`cwd` 及每个 `addDirs`）内创建/修改/删除文件；根之外一律拒绝，且不会询问（`exec` 没有审批通道）。
+- **`read-only`**——只想让它分析、绝不落盘时使用。
+- **`danger-full-access`**——完全不设沙箱，账号能写的地方它都能写；仅限你已隔离的环境。
+
+若 codex 仍报无法写入，检查两点：
+
+1. **确认 DSH 会话工作目录正确**。插件会自动从 DSH 的可信系统上下文读取当前会话目录并传给 `codex exec -C`；只有旧版 DSH 未提供该上下文时才回退到宿主进程目录。若要固定到某个目录，可显式配置 `cwd` 覆盖自动值。
+2. **`cwd` 之外的路径需要 `addDirs`**（或放宽 `sandboxMode`），因为 `workspace-write` 会保护工作根以外的一切。
+
 ## 工作原理
 
 1. DSH 的 agent loop 构建请求并选择 `codex` 提供方
 2. 适配器把会话历史（system + 历史对话 + 最新用户消息）渲染为单个 prompt
-3. 启动 `codex exec --json --ephemeral --skip-git-repo-check -s read-only -m <模型>`，prompt 写入 stdin
+3. 启动 `codex exec --json --ephemeral --skip-git-repo-check -s workspace-write -C <cwd> [--add-dir <目录>] -m <模型>`，prompt 写入 stdin
 4. codex 的 JSONL 事件（`item.completed` 的 `agent_message`/`reasoning`、`turn.completed` 的 usage）实时翻译为 DSH StreamChunk
 5. 关闭块、上报 usage、终止流——与其他 DSH 模型提供方完全一致
 6. **`turn.completed` 一到即终止流**（不等 codex 进程退出），并有两个看门狗兜底静默挂起

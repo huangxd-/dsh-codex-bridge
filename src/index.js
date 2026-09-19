@@ -26,18 +26,27 @@ export const inject = ["llm"];
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
 
 /** Merge user config over defaults; tolerates a missing config object. */
-function resolveConfig(raw) {
+export function resolveConfig(raw) {
   const config = raw && typeof raw === "object" ? raw : {};
   return {
     codexBin: typeof config.codexBin === "string" && config.codexBin.length > 0
       ? config.codexBin
       : undefined,
+    // Default to workspace-write: codex runs as a full agent, so it must be
+    // able to edit files inside its working root out of the box. Unless cwd is
+    // explicitly configured, the adapter derives it from DSH's trusted
+    // per-session system prompt instead of the desktop host process directory.
+    // `read-only` opts back out; `danger-full-access` disables the sandbox.
     sandboxMode: SANDBOX_MODES.includes(config.sandboxMode)
       ? config.sandboxMode
-      : "read-only",
+      : "workspace-write",
     cwd: typeof config.cwd === "string" && config.cwd.length > 0
       ? config.cwd
       : undefined,
+    // Extra directories made writable next to cwd (codex `--add-dir`).
+    addDirs: Array.isArray(config.addDirs)
+      ? config.addDirs.filter((dir) => typeof dir === "string" && dir.length > 0)
+      : [],
     defaultReasoningEffort: CODEX_EFFORTS.includes(config.defaultReasoningEffort)
       ? config.defaultReasoningEffort
       : "high",

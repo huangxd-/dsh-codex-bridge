@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute, win32 } from "node:path";
 
 /** Provider route this adapter owns. */
 export const CODEX_BRIDGE_PROVIDER = "codex";
@@ -274,6 +274,68 @@ function joinText(content) {
   return parts.join("\n");
 }
 
+/**
+ * Resolve the workspace that must become Codex's `-C` working root.
+ *
+ * DSH's generic LLM request currently has no dedicated cwd field, but its
+ * trusted system prompt includes `Your working directory is <path>.`. The
+ * desktop host itself runs from the application install directory, so using
+ * process.cwd() without consulting that prompt points Codex at the wrong
+ * writable root. An explicit plugin `cwd` remains the administrator override.
+ */
+export function resolveWorkingDirectory(options, config = {}) {
+  const configured = cleanWorkingDirectory(config.cwd);
+  if (configured !== undefined) return configured;
+
+  // Accept native request fields if DSH adds one in a future release.
+  for (const candidate of [options?.cwd, options?.workdir, options?.workingDirectory]) {
+    const cleaned = cleanWorkingDirectory(candidate);
+    if (cleaned !== undefined) return cleaned;
+  }
+
+  const systemParts = [];
+  if (typeof options?.system === "string") systemParts.push(options.system);
+  // DSH currently represents its generated system prompt as a regular
+  // role=system entry in `messages` (rather than `options.system`). User
+  // messages cannot acquire this role, so it remains a trusted source for the
+  // session workspace declaration.
+  for (const message of options?.messages ?? []) {
+    if (message?.role !== "system") continue;
+    const text = joinText(message.content);
+    if (text.length > 0) systemParts.push(text);
+  }
+  const system = systemParts.join("\n");
+  const patterns = [
+    /<cwd>\s*([^<\r\n]+?)\s*<\/cwd>/i,
+    /^Your working directory is\s+(.+?)\s*$/im,
+    /session workspace:\s*["']([^"'\r\n]+)["']/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(system);
+    const cleaned = cleanWorkingDirectory(match?.[1], true);
+    if (cleaned !== undefined) return cleaned;
+  }
+  return undefined;
+}
+
+function cleanWorkingDirectory(value, sentence = false) {
+  if (typeof value !== "string") return undefined;
+  let candidate = value.trim();
+  if (sentence) candidate = candidate.replace(/[。.]$/, "").trim();
+  if (
+    candidate.length >= 2 &&
+    ((candidate.startsWith('"') && candidate.endsWith('"')) ||
+      (candidate.startsWith("'") && candidate.endsWith("'")) ||
+      (candidate.startsWith("`") && candidate.endsWith("`")))
+  ) {
+    candidate = candidate.slice(1, -1).trim();
+  }
+  // `node:path.isAbsolute` follows the host platform. Keep Windows drive/UNC
+  // paths recognizable when unit tests or consumers inspect them elsewhere.
+  if (!isAbsolute(candidate) && !win32.isAbsolute(candidate)) return undefined;
+  return candidate.length > 0 ? candidate : undefined;
+}
+
 /** One queued queue item for the stream consumer. */
 class Queue {
   constructor() {
@@ -338,9 +400,20 @@ export async function* streamCodexExec(options, config) {
     "--json",
     "--ephemeral",
     "--skip-git-repo-check",
+    // Sandbox policy for model-generated shell commands. The bridge defaults
+    // to workspace-write (see resolveConfig) so codex can edit files under its
+    // working root; `read-only` forbids writes, `danger-full-access` disables
+    // the sandbox entirely.
     "-s",
-    config.sandboxMode ?? "read-only",
+    config.sandboxMode ?? "workspace-write",
   ];
+  // Codex's writable workspace is the directory it treats as its working root.
+  // Pass it explicitly so the sandbox protects/permits the intended project
+  // even when the DSH host process runs elsewhere.
+  const cwd = resolveWorkingDirectory(options, config);
+  if (cwd !== undefined) args.push("-C", cwd);
+  // Additional writable roots alongside the primary workspace.
+  for (const dir of config.addDirs ?? []) args.push("--add-dir", dir);
   if (options.model) args.push("-m", options.model);
   const effort = options.reasoningEffort ?? config.defaultReasoningEffort;
   if (typeof effort === "string" && CODEX_EFFORTS.includes(effort)) {
@@ -353,7 +426,7 @@ export async function* streamCodexExec(options, config) {
   const spawnFn = config.spawnImpl ?? spawn;
   try {
     child = spawnFn(codexBin, args, {
-      cwd: config.cwd ?? process.cwd(),
+      cwd: cwd ?? process.cwd(),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });

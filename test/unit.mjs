@@ -401,5 +401,116 @@ assert.equal(sFinish?.reason?.failure?.code, "UPSTREAM_TIMEOUT");
 assert.match(sFinish?.reason?.failure?.message ?? "", /no codex events/, "stall message");
 assert.ok(killCalls.length > stallKillsBefore, "stall watchdog killed the stuck child");
 
-console.log("ALL 9 SCENARIOS PASSED (incl. llm/stream invariant grammar)");
-console.log("1 happy | 2 multi-block indices | 3 reconnect survives | 4 turn.failed | 5 empty | 6 abort | 7 completed-terminates | 8 no-output watchdog | 9 stall watchdog");
+// ---------- 10. sandbox/working-root flags: codex must be able to edit files ----------
+// Regression for "codex cannot modify files": the bridge must not pin the
+// spawned exec to read-only, and it must point codex at a writable working
+// root (cwd) plus any extra writable dirs (--add-dir).
+{
+  const { resolveConfig } = await import("../src/index.js");
+  const defaults = resolveConfig({});
+  assert.equal(
+    defaults.sandboxMode, "workspace-write",
+    "default sandbox allows writes inside the working root",
+  );
+  assert.deepEqual(defaults.addDirs, [], "no extra writable dirs by default");
+  assert.equal(resolveConfig({ sandboxMode: "read-only" }).sandboxMode, "read-only",
+    "read-only opt-out honored");
+  assert.equal(resolveConfig({ sandboxMode: "danger-full-access" }).sandboxMode,
+    "danger-full-access", "full-access opt-in honored");
+  assert.equal(resolveConfig({ sandboxMode: "bogus" }).sandboxMode, "workspace-write",
+    "invalid sandbox falls back to workspace-write");
+  assert.deepEqual(
+    resolveConfig({ addDirs: ["D:/a", "", 5, "D:/b"] }).addDirs,
+    ["D:/a", "D:/b"],
+    "addDirs keeps only non-empty strings",
+  );
+
+  const sandboxSpawnCalls = spawnCalls.length;
+  const projectDir = "D:\\repos\\my-project";
+  const sandboxChunks = await collect(
+    { ...baseOptions, messages: [{ role: "user", content: [{ type: "text", text: "edit a file" }] }] },
+    makeFakeSpawn({
+      events: [
+        { type: "turn.started" },
+        { type: "item.completed", item: { id: "ag_1", type: "agent_message", text: "done" } },
+        { type: "turn.completed", usage: { input_tokens: 4, output_tokens: 2 } },
+      ],
+    }),
+    {
+      sandboxMode: undefined, // exercise the adapter's own fallback
+      cwd: projectDir,
+      addDirs: ["D:\\repos\\shared-lib", "D:\\repos\\docs"],
+    },
+  );
+  assertInvariant(sandboxChunks, "sandbox-flags");
+  const sandboxCall = spawnCalls[sandboxSpawnCalls];
+  const sArgs = sandboxCall.args;
+  assert.equal(sArgs[sArgs.indexOf("-s") + 1], "workspace-write",
+    "sandbox flag defaults to workspace-write, not read-only");
+  assert.ok(!sArgs.includes("read-only"), "never silently pins codex to read-only");
+  assert.equal(sArgs[sArgs.indexOf("-C") + 1], projectDir,
+    "explicit codex working root");
+  assert.equal(sandboxCall.options.cwd, projectDir, "spawn cwd matches the working root");
+  const addDirValues = sArgs.reduce(
+    (acc, arg, i) => (arg === "--add-dir" ? [...acc, sArgs[i + 1]] : acc), [],
+  );
+  assert.deepEqual(addDirValues, ["D:\\repos\\shared-lib", "D:\\repos\\docs"],
+    "extra writable dirs passed as --add-dir");
+  assert.equal(sandboxChunks.find((c) => c.type === "finish")?.reason?.kind, "stop");
+
+  const sessionSpawnCalls = spawnCalls.length;
+  const sessionDir = "D:\\repos\\danmu_api";
+  const sessionChunks = await collect(
+    {
+      ...baseOptions,
+      system: undefined,
+      messages: [
+        {
+          role: "system",
+          content: [{
+            type: "text",
+            text: `Harness instructions.\n\nYour working directory is ${sessionDir}.`,
+          }],
+        },
+        { role: "user", content: [{ type: "text", text: "edit globals.js" }] },
+      ],
+    },
+    makeFakeSpawn({
+      events: [
+        { type: "turn.started" },
+        { type: "item.completed", item: { id: "ag_session", type: "agent_message", text: "done" } },
+        { type: "turn.completed", usage: { input_tokens: 4, output_tokens: 2 } },
+      ],
+    }),
+    { sandboxMode: "workspace-write" },
+  );
+  assertInvariant(sessionChunks, "session-working-root");
+  const sessionCall = spawnCalls[sessionSpawnCalls];
+  assert.equal(sessionCall.args[sessionCall.args.indexOf("-C") + 1], sessionDir,
+    "DSH session working directory becomes the Codex working root");
+  assert.equal(sessionCall.options.cwd, sessionDir,
+    "spawn cwd follows DSH's role=system session context instead of the desktop host");
+
+  const overrideSpawnCalls = spawnCalls.length;
+  const overrideDir = "D:\\repos\\configured-project";
+  await collect(
+    {
+      ...baseOptions,
+      system: `Your working directory is ${sessionDir}.`,
+      messages: [{ role: "user", content: [{ type: "text", text: "edit configured project" }] }],
+    },
+    makeFakeSpawn({
+      events: [
+        { type: "item.completed", item: { id: "ag_override", type: "agent_message", text: "done" } },
+        { type: "turn.completed", usage: { input_tokens: 2, output_tokens: 1 } },
+      ],
+    }),
+    { cwd: overrideDir },
+  );
+  const overrideCall = spawnCalls[overrideSpawnCalls];
+  assert.equal(overrideCall.options.cwd, overrideDir,
+    "explicit plugin cwd overrides the inferred DSH session directory");
+}
+
+console.log("ALL 10 SCENARIOS PASSED (incl. llm/stream invariant grammar)");
+console.log("1 happy | 2 multi-block indices | 3 reconnect survives | 4 turn.failed | 5 empty | 6 abort | 7 completed-terminates | 8 no-output watchdog | 9 stall watchdog | 10 sandbox/working-root flags");

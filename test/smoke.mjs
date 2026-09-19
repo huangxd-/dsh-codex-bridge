@@ -21,7 +21,8 @@ const options = {
 let text = "";
 let reasoning = "";
 for await (const chunk of streamCodexExec(options, {
-  sandboxMode: "read-only",
+  sandboxMode: "workspace-write",
+  cwd: process.cwd(),
   defaultReasoningEffort: "high",
 })) {
   switch (chunk.type) {
